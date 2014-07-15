@@ -26,7 +26,7 @@ from ConfigParser import SafeConfigParser
 from django.conf import settings
 from graphite.render.datalib import TimeSeries
 from graphite.util import json
-
+from graphite.logger import log
 
 import pytz
 
