@@ -447,20 +447,25 @@ class Graph:
     if self.outputFormat == 'png':
       self.surface.write_to_png(fileObj)
     else:
-      metaData = {
-        'x': {
-          'start': self.startTime,
-          'end': self.endTime
-        },
-        'options': {
-          'lineWidth': self.lineWidth
-        },
-        'font': self.defaultFontParams,
-        'area': self.area,
-        'series': []
-      }
-
-      if not self.secondYAxis:
+      if self.data:
+        metaData = {
+          'x': {
+            'start': self.startTime,
+            'end': self.endTime
+          },
+          'options': {
+            'lineWidth': self.lineWidth
+          },
+          'font': self.defaultFontParams,
+          'area': self.area,
+          'series': []
+        }
+      else:
+        metaData = {
+          'font': self.defaultFontParams,
+          'area': self.area    
+        }
+      if self.data and not self.secondYAxis:
         metaData['y'] = {
           'top': self.yTop,
           'bottom': self.yBottom,
