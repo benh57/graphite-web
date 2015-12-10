@@ -13,18 +13,15 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 import re
-from django.shortcuts import render_to_response
 from django.conf import settings
+from django.shortcuts import render_to_response
+from django.utils.safestring import mark_safe
+from django.utils.html import escape
 from graphite.account.models import Profile
 from graphite.compat import HttpResponse
 from graphite.util import getProfile, getProfileByUsername, json
 from graphite.logger import log
 from hashlib import md5
-
-try:
-  import cPickle as pickle
-except ImportError:
-  import pickle
 
 
 def header(request):
@@ -40,8 +37,8 @@ def header(request):
 def browser(request):
   "View for the top-level frame of the browser UI"
   context = {
-    'queryString' : request.GET.urlencode(),
-    'target' : request.GET.get('target')
+    'queryString': mark_safe(request.GET.urlencode()),
+    'target': request.GET.get('target')
   }
   if context['queryString']:
     context['queryString'] = context['queryString'].replace('#','%23')
@@ -95,7 +92,7 @@ def myGraphLookup(request):
   }
 
   try:
-    path = str( request.GET['path'] )
+    path = request.GET.get('path', u'')
 
     if path:
       if path.endswith('.'):
@@ -105,7 +102,7 @@ def myGraphLookup(request):
         userpath_prefix = path + '.'
 
     else:
-      userpath_prefix = ""
+      userpath_prefix = u""
 
     matches = [ graph for graph in profile.mygraph_set.all().order_by('name') if graph.name.startswith(userpath_prefix) ]
 
@@ -128,15 +125,15 @@ def myGraphLookup(request):
          if name in leaf_inserted: continue
          leaf_inserted.add(name)
 
-      node = {'text' : str(name) }
+      node = {'text': escape(name)}
 
       if isBranch:
-        node.update( { 'id' : str(userpath_prefix + name + '.') } )
+        node.update({'id': userpath_prefix + name + '.'})
         node.update(branchNode)
 
       else:
         m = md5()
-        m.update(name)
+        m.update(name.encode('utf-8'))
         node.update( { 'id' : str(userpath_prefix + m.hexdigest()), 'graphUrl' : str(graph.url) } )
         node.update(leafNode)
 
@@ -215,7 +212,7 @@ def userGraphLookup(request):
 
         if '.' in relativePath: # branch
           node = {
-            'text' : str(nodeName),
+            'text' : escape(str(nodeName)),
             'id' : str(username + '.' + prefix + nodeName + '.'),
           }
           node.update(branchNode)
@@ -224,7 +221,7 @@ def userGraphLookup(request):
           m.update(nodeName)
 
           node = {
-            'text' : str(nodeName ),
+            'text' : escape(str(nodeName)),
             'id' : str(username + '.' + prefix + m.hexdigest()),
             'graphUrl' : str(graph.url),
           }
@@ -239,6 +236,8 @@ def userGraphLookup(request):
     no_graphs = { 'text' : "No saved graphs", 'id' : 'no-click' }
     no_graphs.update(leafNode)
     nodes.append(no_graphs)
+
+  nodes.sort()
 
   return json_response(nodes, request)
 

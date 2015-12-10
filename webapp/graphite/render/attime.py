@@ -12,11 +12,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License."""
 
+import pytz
 from datetime import datetime,timedelta
 from time import daylight
 from django.conf import settings
-
-import pytz
 
 months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec']
 weekdays = ['sun','mon','tue','wed','thu','fri','sat']
@@ -30,7 +29,7 @@ def parseATTime(s, tzinfo=None):
       pass #Fall back because its not a timestamp, its YYYYMMDD form
     else:
       return datetime.fromtimestamp(int(s),tzinfo)
-  elif ':' in s and len(s) == 11:
+  elif ':' in s and len(s) == 13:
     return tzinfo.localize(datetime.strptime(s,'%H:%M%Y%m%d'), daylight)
   if '+' in s:
     ref,offset = s.split('+',1)
@@ -40,7 +39,7 @@ def parseATTime(s, tzinfo=None):
     offset = '-' + offset
   else:
     ref,offset = s,''
-  return tzinfo.localize(parseTimeReference(ref), daylight) + parseTimeOffset(offset)
+  return tzinfo.localize((parseTimeReference(ref) + parseTimeOffset(offset)), daylight)
 
 
 def parseTimeReference(ref):

@@ -27,7 +27,7 @@ with open('setup.cfg', 'r') as f:
 cf = ConfigParser.ConfigParser()
 cf.readfp(BytesIO(orig_setup_cfg), 'setup.cfg')
 
-if os.environ.get('GRAPHITE_NO_PREFIX'):
+if os.environ.get('GRAPHITE_NO_PREFIX') or os.environ.get('READTHEDOCS'):
     cf.remove_section('install')
 else:
     try:
@@ -78,14 +78,13 @@ try:
         'graphite',
         'graphite.account',
         'graphite.browser',
-        'graphite.cli',
         'graphite.composer',
         'graphite.dashboard',
         'graphite.events',
         'graphite.finders',
-        'graphite.graphlot',
         'graphite.metrics',
         'graphite.render',
+        'graphite.url_shortener',
         'graphite.version',
         'graphite.whitelist',
       ],

@@ -11,15 +11,13 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License."""
+from urllib2 import urlopen
 
-import traceback
 from django.conf import settings
-from graphite.account.models import Profile
 from graphite.compat import HttpResponse, HttpResponseBadRequest
-from graphite.util import getProfile, getProfileByUsername, json
+from graphite.util import getProfile, json
 from graphite.logger import log
 from graphite.storage import STORE
-from graphite.metrics.search import searcher
 from graphite.carbonlink import CarbonLink
 import fnmatch, os
 
@@ -35,19 +33,19 @@ def index_json(request):
 
   def find_matches():
     matches = []
-  
+
     for root, dirs, files in os.walk(settings.WHISPER_DIR):
       root = root.replace(settings.WHISPER_DIR, '')
       for basename in files:
         if fnmatch.fnmatch(basename, '*.wsp'):
           matches.append(os.path.join(root, basename))
-  
+
     for root, dirs, files in os.walk(settings.CERES_DIR):
       root = root.replace(settings.CERES_DIR, '')
       for filename in files:
         if filename == '.ceres-node':
           matches.append(root)
-  
+
     matches = [
       m
       .replace('.wsp', '')
@@ -67,24 +65,6 @@ def index_json(request):
   return json_response_for(request, matches, jsonp=jsonp)
 
 
-def search_view(request):
-  try:
-    query = str( request.REQUEST['query'] )
-  except:
-    return HttpResponseBadRequest(content="Missing required parameter 'query'",
-                                  content_type="text/plain")
-  search_request = {
-    'query' : query,
-    'max_results' : int( request.REQUEST.get('max_results', 25) ),
-    'keep_query_pattern' : int(request.REQUEST.get('keep_query_pattern', 0)),
-  }
-  #if not search_request['query'].endswith('*'):
-  #  search_request['query'] += '*'
-
-  results = sorted(searcher.search(**search_request))
-  return json_response_for(request, dict(metrics=results))
-
-
 def find_view(request):
   "View for finding metrics matching a given pattern"
   profile = getProfile(request)
@@ -93,6 +73,7 @@ def find_view(request):
   wildcards = int( request.REQUEST.get('wildcards', 0) )
   fromTime = int( request.REQUEST.get('from', -1) )
   untilTime = int( request.REQUEST.get('until', -1) )
+  jsonp = request.REQUEST.get('jsonp', False)
 
   if fromTime == -1:
     fromTime = None
@@ -154,7 +135,7 @@ def find_view(request):
       wildcardNode = {'name' : '*'}
       results.append(wildcardNode)
 
-    response = json_response_for(request, { 'metrics' : results})
+    response = json_response_for(request, { 'metrics' : results }, jsonp=jsonp)
 
   else:
     return HttpResponseBadRequest(
@@ -316,7 +297,7 @@ def json_response_for(request, data, content_type='application/json',
 
   content = json.dumps(data, ensure_ascii=ensure_ascii)
   if jsonp:
-    content = "%s(%)" % (jsonp, content)
+    content = "%s(%s)" % (jsonp, content)
     content_type = 'text/javascript'
   if not ensure_ascii:
     content_type += ';charset=utf-8'

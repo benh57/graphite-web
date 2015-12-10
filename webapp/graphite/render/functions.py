@@ -12,28 +12,27 @@
 #See the License for the specific language governing permissions and
 #limitations under the License.
 
-
-from datetime import date, datetime, timedelta
-from functools import partial
-from itertools import izip, imap
 import math
-import re
 import random
+import re
 import time
 
-from graphite.logger import log
-from graphite.render.attime import parseTimeOffset
-
-from graphite.events import models
-
-#XXX format_units() should go somewhere else
+from datetime import datetime, timedelta
+from itertools import izip, imap
 from os import environ
+
+from graphite.logger import log
+from graphite.render.attime import parseTimeOffset, parseATTime
+from graphite.events import models
+from graphite.util import epoch
+
+# XXX format_units() should go somewhere else
 if environ.get('READTHEDOCS'):
   format_units = lambda *args, **kwargs: (0,'')
 else:
   from graphite.render.glyph import format_units
   from graphite.render.datalib import TimeSeries
-  from graphite.util import timestamp
+
 
 NAN = float('NaN')
 INF = float('inf')
@@ -61,6 +60,14 @@ def safeDiv(a, b):
   if a is None: return None
   if b in (0,None): return None
   return float(a) / float(b)
+
+def safePow(a, b):
+  if a is None: return None
+  try:
+    result = math.pow(a, b)
+  except ValueError:
+    return None
+  return result
 
 def safeMul(*factors):
   if None in factors:
@@ -110,6 +117,10 @@ def safeAbs(value):
   if value is None: return None
   return abs(value)
 
+def safeIsNotEmpty(values):
+    safeValues = [v for v in values if v is not None]
+    return len(safeValues) > 0
+
 # Greatest common divisor
 def gcd(a, b):
   if b == 0:
@@ -123,14 +134,26 @@ def lcm(a, b):
   return a / gcd(a,b) * b
 
 def normalize(seriesLists):
-  seriesList = reduce(lambda L1,L2: L1+L2,seriesLists)
-  step = reduce(lcm,[s.step for s in seriesList])
-  for s in seriesList:
-    s.consolidate( step / s.step )
-  start = min([s.start for s in seriesList])
-  end = max([s.end for s in seriesList])
-  end -= (end - start) % step
-  return (seriesList,start,end,step)
+  if seriesLists:
+    seriesList = reduce(lambda L1,L2: L1+L2,seriesLists)
+    if seriesList:
+      step = reduce(lcm,[s.step for s in seriesList])
+      for s in seriesList:
+        s.consolidate( step / s.step )
+      start = min([s.start for s in seriesList])
+      end = max([s.end for s in seriesList])
+      end -= (end - start) % step
+      return (seriesList,start,end,step)
+  raise NormalizeEmptyResultError()
+
+class NormalizeEmptyResultError(Exception):
+  # throw error for normalize() when empty
+  pass
+
+
+def matchSeries(seriesList1, seriesList2):
+  assert len(seriesList2) == len(seriesList1), "The number of series in each argument must be the same"
+  return izip(sorted(seriesList1, lambda a,b: cmp(a.name, b.name)), sorted(seriesList2, lambda a,b: cmp(a.name, b.name)))
 
 def formatPathExpressions(seriesList):
    # remove duplicates
@@ -199,7 +222,7 @@ def sumSeriesWithWildcards(requestContext, seriesList, *position): #XXX
 
   for series in seriesList:
     newname = '.'.join(map(lambda x: x[1], filter(lambda i: i[0] not in positions, enumerate(series.name.split('.')))))
-    if newname in newSeries.keys():
+    if newname in newSeries:
       newSeries[newname] = sumSeries(requestContext, (series, newSeries[newname]))[0]
     else:
       newSeries[newname] = series
@@ -238,17 +261,58 @@ def averageSeriesWithWildcards(requestContext, seriesList, *position): #XXX
     result[-1].name = name
   return result
 
+def multiplySeriesWithWildcards(requestContext, seriesList, *position): #XXX
+  """
+  Call multiplySeries after inserting wildcards at the given position(s).
+
+  Example:
+
+  .. code-block:: none
+
+    &target=multiplySeriesWithWildcards([web.host-[0-7].avg-response.value, web.host-[0-7].total-request.value], 2,3)
+
+  This would be the equivalent of
+  ``target=multiplySeries(web.host-0.avg-response.value, web.host-0.total-request.value)&target=multiplySeries(web.host-1.avg-response.value, web.host-1.total-request.value)...``
+
+  """
+  if type(position) is int:
+    positions = [position]
+  else:
+    positions = position
+
+  newSeries = {}
+  newNames = list()
+
+  for series in seriesList:
+    newname = '.'.join(map(lambda x: x[1], filter(lambda i: i[0] not in positions, enumerate(series.name.split('.')))))
+    if newname in newSeries:
+      newSeries[newname] = multiplySeries(requestContext, (newSeries[newname], series))[0]
+    else:
+      newSeries[newname] = series
+      newNames.append(newname)
+    newSeries[newname].name = newname
+  return [newSeries[name] for name in newNames]
+
 def diffSeries(requestContext, *seriesLists):
   """
-  Can take two or more metrics, or a single metric and a constant.
-  Subtracts parameters 2 through n from parameter 1.
+  Subtracts series 2 through n from series 1.
 
   Example:
 
   .. code-block:: none
 
     &target=diffSeries(service.connections.total,service.connections.failed)
-    &target=diffSeries(service.connections.total,5)
+
+  To diff a series and a constant, one should use offset instead of (or in
+  addition to) diffSeries
+
+  Example:
+
+  .. code-block:: none
+
+    &target=offset(service.connections.total,-5)
+
+    &target=offset(diffSeries(service.connections.total,service.connections.failed),-4)
 
   """
   (seriesList,start,end,step) = normalize(seriesLists)
@@ -365,7 +429,7 @@ def percentileOfSeries(requestContext, seriesList, n, interpolate=False):
   if n <= 0:
     raise ValueError('The requested percent is required to be greater than 0')
 
-  name = 'percentilesOfSeries(%s,%g)' % (seriesList[0].pathExpression, n)
+  name = 'percentileOfSeries(%s,%g)' % (seriesList[0].pathExpression, n)
   (start, end, step) = normalize([seriesList])[1:]
   values = [ _getPercentile(row, n, interpolate) for row in izip(*seriesList) ]
   resultSeries = TimeSeries(name, start, end, step, values)
@@ -416,7 +480,34 @@ def keepLastValue(requestContext, seriesList, limit = INF):
 
   return seriesList
 
-def asPercent(requestContext, seriesList, total=None):
+def changed(requestContext, seriesList):
+  """
+  Takes one metric or a wildcard seriesList.
+  Output 1 when the value changed, 0 when null or the same
+
+  Example:
+
+  .. code-block:: none
+
+    &target=changed(Server01.connections.handled)
+
+  """
+  for series in seriesList:
+    series.name = "changed(%s)" % (series.name)
+    series.pathExpression = series.name
+    previous = None
+    for i,value in enumerate(series):
+      if previous is None:
+        previous = value
+        series[i] = 0
+      elif value is not None and previous != value:
+        series[i] = 1
+        previous = value
+      else:
+        series[i] = 0
+  return seriesList
+
+def asPercent(requestContext, seriesList, seriesList2orNumber=None):
   """
 
   Calculates a percentage of the total of a wildcard series. If `total` is specified,
@@ -430,6 +521,7 @@ def asPercent(requestContext, seriesList, total=None):
   .. code-block:: none
 
     &target=asPercent(Server01.connections.{failed,succeeded}, Server01.connections.attempted)
+    &target=asPercent(Server*.connections.{failed,succeeded}, Server*.connections.attempted)
     &target=asPercent(apache01.threads.busy,1500)
     &target=asPercent(Server01.cpu.*.jiffies)
 
@@ -437,31 +529,42 @@ def asPercent(requestContext, seriesList, total=None):
 
   normalize([seriesList])
 
-  if total is None:
+  if seriesList2orNumber is None:
     totalValues = [ safeSum(row) for row in izip(*seriesList) ]
     totalText = None # series.pathExpression
-  elif isinstance(total, list):
-    if len(total) != 1:
-      raise ValueError("asPercent second argument must reference exactly 1 series")
-    normalize([seriesList, total])
-    totalValues = total[0]
-    totalText = totalValues.name
+  elif type(seriesList2orNumber) is list:
+    if len(seriesList2orNumber) != 1 and len(seriesList2orNumber) != len(seriesList):
+      raise ValueError("asPercent second argument must be missing, a single digit, reference exactly 1 series or reference the same number of series as the first argument")
+
+    if len(seriesList2orNumber) == 1:
+      normalize([seriesList, seriesList2orNumber])
+      totalValues = seriesList2orNumber[0]
+      totalText = totalValues.name
   else:
-    totalValues = [total] * len(seriesList[0])
-    totalText = str(total)
+    totalValues = [seriesList2orNumber] * len(seriesList[0])
+    totalText = str(seriesList2orNumber)
 
   resultList = []
-  for series in seriesList:
-    resultValues = [ safeMul(safeDiv(val, totalVal), 100.0) for val,totalVal in izip(series,totalValues) ]
+  if type(seriesList2orNumber) is list and len(seriesList2orNumber) == len(seriesList):
+    for series1, series2 in matchSeries(seriesList, seriesList2orNumber):
+      name = "asPercent(%s,%s)" % (series1.name,series2.name)
+      (seriesList,start,end,step) = normalize([(series1, series2)])
+      resultValues = [ safeMul(safeDiv(v1, v2), 100.0) for v1,v2 in izip(series1,series2) ]
+      resultSeries = TimeSeries(name,start,end,step,resultValues)
+      resultSeries.pathExpression = name
+      resultList.append(resultSeries)
+  else:
+    for series in seriesList:
+      resultValues = [ safeMul(safeDiv(val, totalVal), 100.0) for val,totalVal in izip(series,totalValues) ]
 
-    name = "asPercent(%s, %s)" % (series.name, totalText or series.pathExpression)
-    resultSeries = TimeSeries(name,series.start,series.end,series.step,resultValues)
-    resultSeries.pathExpression = name
-    resultList.append(resultSeries)
+      name = "asPercent(%s, %s)" % (series.name, totalText or series.pathExpression)
+      resultSeries = TimeSeries(name,series.start,series.end,series.step,resultValues)
+      resultSeries.pathExpression = name
+      resultList.append(resultSeries)
 
   return resultList
 
-def divideSeries(requestContext, dividendSeriesList, divisorSeriesList):
+def divideSeries(requestContext, dividendSeriesList, divisorSeries):
   """
   Takes a dividend metric and a divisor metric and draws the division result.
   A constant may *not* be passed. To divide by a constant, use the scale()
@@ -476,10 +579,10 @@ def divideSeries(requestContext, dividendSeriesList, divisorSeriesList):
 
 
   """
-  if len(divisorSeriesList) != 1:
+  if len(divisorSeries) != 1:
     raise ValueError("divideSeries second argument must reference exactly 1 series")
 
-  divisorSeries = divisorSeriesList[0]
+  divisorSeries = divisorSeries[0]
   results = []
 
   for dividendSeries in dividendSeriesList:
@@ -529,7 +632,7 @@ def multiplySeries(requestContext, *seriesLists):
 
 def weightedAverage(requestContext, seriesListAvg, seriesListWeight, node):
   """
-  Takes a series of average values and a series of weights and 
+  Takes a series of average values and a series of weights and
   produces a weighted average for all values.
 
   The corresponding values should share a node as defined
@@ -539,7 +642,7 @@ def weightedAverage(requestContext, seriesListAvg, seriesListWeight, node):
 
   .. code-block:: none
 
-    &target=weightedAverage(*.transactions.mean,*.transactions.count,0) 
+    &target=weightedAverage(*.transactions.mean,*.transactions.count,0)
 
   """
 
@@ -577,10 +680,10 @@ def weightedAverage(requestContext, seriesListAvg, seriesListWeight, node):
   sumWeights=sumSeries(requestContext, seriesListWeight)[0]
 
   resultValues = [ safeDiv(val1, val2) for val1,val2 in izip(sumProducts,sumWeights) ]
-  name = "weightedAverage(%s, %s)" % (','.join(set(s.pathExpression for s in seriesListAvg)) ,','.join(set(s.pathExpression for s in seriesListWeight)))
+  name = "weightedAverage(%s, %s, %s)" % (','.join(set(s.pathExpression for s in seriesListAvg)) ,','.join(set(s.pathExpression for s in seriesListWeight)), node)
   resultSeries = TimeSeries(name,sumProducts.start,sumProducts.end,sumProducts.step,resultValues)
   resultSeries.pathExpression = name
-  return resultSeries
+  return [resultSeries]
 
 def movingMedian(requestContext, seriesList, windowSize):
   """
@@ -590,7 +693,7 @@ def movingMedian(requestContext, seriesList, windowSize):
   Takes one metric or a wildcard seriesList followed by a number N of datapoints
   or a quoted string with a length of time like '1hour' or '5min' (See ``from /
   until`` in the render\_api_ for examples of time formats). Graphs the
-  median of the preceeding datapoints for each point on the graph. All
+  median of the preceding datapoints for each point on the graph. All
   previous datapoints are set to None at the beginning of the graph.
 
   Example:
@@ -601,6 +704,8 @@ def movingMedian(requestContext, seriesList, windowSize):
     &target=movingMedian(Server.instance*.threads.idle,'5min')
 
   """
+  if not seriesList:
+    return []
   windowInterval = None
   if isinstance(windowSize, basestring):
     delta = parseTimeOffset(windowSize)
@@ -660,23 +765,6 @@ def scale(requestContext, seriesList, factor):
       series[i] = safeMul(value,factor)
   return seriesList
 
-def invert(requestContext, seriesList):
-  """
-  Takes one metric or a wildcard seriesList, and inverts each datapoint (i.e. 1/x).
-
-  Example:
-
-  .. code-block:: none
-
-    &target=invert(Server.instance01.threads.busy)
-
-  """
-  for series in seriesList:
-    series.name = "invert(%s)" % (series.name)
-    for i,value in enumerate(series):
-      series[i] = safeDiv(1,value)
-  return seriesList
-
 def scaleToSeconds(requestContext, seriesList, seconds):
   """
   Takes one metric or a wildcard seriesList and returns "value per seconds" where
@@ -692,6 +780,60 @@ def scaleToSeconds(requestContext, seriesList, seconds):
     for i,value in enumerate(series):
       factor = seconds * 1.0 / series.step
       series[i] = safeMul(value,factor)
+  return seriesList
+
+def pow(requestContext, seriesList, factor):
+  """
+  Takes one metric or a wildcard seriesList followed by a constant, and raises the datapoint
+  by the power of the constant provided at each point.
+
+  Example:
+
+  .. code-block:: none
+
+    &target=pow(Server.instance01.threads.busy,10)
+    &target=pow(Server.instance*.threads.busy,10)
+
+  """
+  for series in seriesList:
+    series.name = "pow(%s,%g)" % (series.name,float(factor))
+    series.pathExpression = series.name
+    for i,value in enumerate(series):
+      series[i] = safePow(value,factor)
+  return seriesList
+
+def squareRoot(requestContext, seriesList):
+  """
+  Takes one metric or a wildcard seriesList, and computes the square root of each datapoint.
+
+  Example:
+
+  .. code-block:: none
+
+    &target=squareRoot(Server.instance01.threads.busy)
+
+  """
+  for series in seriesList:
+    series.name = "squareRoot(%s)" % (series.name)
+    for i,value in enumerate(series):
+      series[i] = safePow(value, 0.5)
+  return seriesList
+
+def invert(requestContext, seriesList):
+  """
+  Takes one metric or a wildcard seriesList, and inverts each datapoint (i.e. 1/x).
+
+  Example:
+
+  .. code-block:: none
+
+    &target=invert(Server.instance01.threads.busy)
+
+  """
+  for series in seriesList:
+    series.name = "invert(%s)" % (series.name)
+    for i,value in enumerate(series):
+        series[i] = safePow(value, -1)
   return seriesList
 
 def absolute(requestContext, seriesList):
@@ -779,7 +921,7 @@ def movingAverage(requestContext, seriesList, windowSize):
   Takes one metric or a wildcard seriesList followed by a number N of datapoints
   or a quoted string with a length of time like '1hour' or '5min' (See ``from /
   until`` in the render\_api_ for examples of time formats). Graphs the
-  average of the preceeding datapoints for each point on the graph. All
+  average of the preceding datapoints for each point on the graph. All
   previous datapoints are set to None at the beginning of the graph.
 
   Example:
@@ -790,6 +932,8 @@ def movingAverage(requestContext, seriesList, windowSize):
     &target=movingAverage(Server.instance*.threads.idle,'5min')
 
   """
+  if not seriesList:
+    return []
   windowInterval = None
   if isinstance(windowSize, basestring):
     delta = parseTimeOffset(windowSize)
@@ -1070,7 +1214,32 @@ def stacked(requestContext,seriesLists,stackName='__DEFAULT__'):
 
 def areaBetween(requestContext, seriesList):
   """
-  Draws the area in between the two series in seriesList
+  Draws the vertical area in between the two series in seriesList. Useful for
+  visualizing a range such as the minimum and maximum latency for a service.
+
+  areaBetween expects **exactly one argument** that results in exactly two series
+  (see example below). The order of the lower and higher values series does not
+  matter. The visualization only works when used in conjunction with
+  ``areaMode=stacked``.
+
+  Most likely use case is to provide a band within which another metric should
+  move. In such case applying an ``alpha()``, as in the second example, gives
+  best visual results.
+
+  Example:
+
+  .. code-block:: none
+
+    &target=areaBetween(service.latency.{min,max})&areaMode=stacked
+
+    &target=alpha(areaBetween(service.latency.{min,max}),0.3)&areaMode=stacked
+
+  If for instance, you need to build a seriesList, you should use the ``group``
+  function, like so:
+
+  .. code-block:: none
+
+    &target=areaBetween(group(minSeries(a.*.min),maxSeries(a.*.max)))
   """
   assert len(seriesList) == 2, "areaBetween series argument must reference *exactly* 2 series"
   lower = seriesList[0]
@@ -1118,14 +1287,27 @@ def alias(requestContext, seriesList, newName):
 def cactiStyle(requestContext, seriesList, system=None):
   """
   Takes a series list and modifies the aliases to provide column aligned
-  output with Current, Max, and Min values in the style of cacti. Optonally
+  output with Current, Max, and Min values in the style of cacti. Optionally
   takes a "system" value to apply unit formatting in the same style as the
   Y-axis.
-  NOTE: column alignment only works with monospace fonts such as terminus.
 
   .. code-block:: none
 
     &target=cactiStyle(ganglia.*.net.bytes_out,"si")
+
+  A possible value for ``system`` is ``si``, which would express your values in
+  multiples of a thousand. A second option is to use ``binary`` which will
+  instead express your values in multiples of 1024 (useful for network devices).
+
+  Column alignment of the Current, Max, Min values works under two conditions:
+  you use a monospace font such as terminus and use a single cactiStyle call, as
+  separate cactiStyle calls are not aware of each other. In case you have
+  different targets for which you would like to have cactiStyle to line up, you
+  can use ``group()`` to combine them before applying cactiStyle, such as:
+
+  .. code-block:: none
+
+    &target=cactiStyle(group(metricA,metricB))
 
   """
   if 0 == len(seriesList):
@@ -1191,7 +1373,7 @@ def aliasByMetric(requestContext, seriesList):
 
   """
   for series in seriesList:
-    series.name = series.name.split('.')[-1]
+    series.name = series.name.split('.')[-1].split(',')[0]
   return seriesList
 
 def legendValue(requestContext, seriesList, *valueTypes):
@@ -1235,7 +1417,7 @@ def legendValue(requestContext, seriesList, *valueTypes):
         value = valueFunc(series)
         formatted = None
         if value is not None:
-          formatted = "%.2f%s" % format_units(abs(value), system=system)
+          formatted = "%.2f%s" % format_units(value, system=system)
         series.name = "%-20s%-5s%-10s" % (series.name, valueType, formatted)
   return seriesList
 
@@ -1380,6 +1562,26 @@ def maximumBelow(requestContext, seriesList, n):
   result = []
   for series in seriesList:
     if max(series) <= n:
+      result.append(series)
+  return result
+
+def minimumBelow(requestContext, seriesList, n):
+  """
+  Takes one metric or a wildcard seriesList followed by a constant n.
+  Draws only the metrics with a minimum value below n.
+
+  Example:
+
+  .. code-block:: none
+
+    &target=minimumBelow(system.interface.eth*.packetsSent,1000)
+
+  This would only display interfaces which at one point sent less than 1000 packets/min.
+  """
+
+  result = []
+  for series in seriesList:
+    if min(series) <= n:
       result.append(series)
   return result
 
@@ -1633,7 +1835,10 @@ def removeAbovePercentile(requestContext, seriesList, n):
   for s in seriesList:
     s.name = 'removeAbovePercentile(%s, %d)' % (s.name, n)
     s.pathExpression = s.name
-    percentile = nPercentile(requestContext, [s], n)[0][0]
+    try:
+      percentile = nPercentile(requestContext, [s], n)[0][0]
+    except IndexError:
+      continue
     for (index, val) in enumerate(s):
       if val > percentile:
         s[index] = None
@@ -1643,7 +1848,7 @@ def removeAbovePercentile(requestContext, seriesList, n):
 def removeAboveValue(requestContext, seriesList, n):
   """
   Removes data above the given threshold from the series or list of series provided.
-  Values above this threshole are assigned a value of None
+  Values above this threshold are assigned a value of None.
   """
   for s in seriesList:
     s.name = 'removeAboveValue(%s, %d)' % (s.name, n)
@@ -1662,7 +1867,10 @@ def removeBelowPercentile(requestContext, seriesList, n):
   for s in seriesList:
     s.name = 'removeBelowPercentile(%s, %d)' % (s.name, n)
     s.pathExpression = s.name
-    percentile = nPercentile(requestContext, [s], n)[0][0]
+    try:
+      percentile = nPercentile(requestContext, [s], n)[0][0]
+    except IndexError:
+      continue
     for (index, val) in enumerate(s):
       if val < percentile:
         s[index] = None
@@ -1672,7 +1880,7 @@ def removeBelowPercentile(requestContext, seriesList, n):
 def removeBelowValue(requestContext, seriesList, n):
   """
   Removes data below the given threshold from the series or list of series provided.
-  Values below this threshole are assigned a value of None
+  Values below this threshold are assigned a value of None.
   """
   for s in seriesList:
     s.name = 'removeBelowValue(%s, %d)' % (s.name, n)
@@ -1700,16 +1908,28 @@ def limit(requestContext, seriesList, n):
   """
   return seriesList[0:n]
 
-def sortByName(requestContext, seriesList):
+def sortByName(requestContext, seriesList, natural=False):
   """
   Takes one metric or a wildcard seriesList.
-
-  Sorts the list of metrics by the metric name.
+  Sorts the list of metrics by the metric name using either alphabetical order or natural sorting.
+  Natural sorting allows names containing numbers to be sorted more naturally, e.g:
+  - Alphabetical sorting: server1, server11, server12, server2
+  - Natural sorting: server1, server2, server11, server12
   """
+  def paddedName(name):
+    return re.sub("(\d+)", lambda x: "{0:010}".format(int(x.group(0))), name)
+
   def compare(x,y):
     return cmp(x.name, y.name)
 
-  seriesList.sort(compare)
+  def natSortCompare(x,y):
+    return cmp(paddedName(x.name), paddedName(y.name))
+
+  if natural:
+    seriesList.sort(natSortCompare)
+  else:
+    seriesList.sort(compare)
+
   return seriesList
 
 def sortByTotal(requestContext, seriesList):
@@ -1790,6 +2010,25 @@ def useSeriesAbove(requestContext, seriesList, value, search, replace):
 
   return newSeries
 
+def fallbackSeries(requestContext, seriesList, fallback):
+    """
+    Takes a wildcard seriesList, and a second fallback metric.
+    If the wildcard does not match any series, draws the fallback metric.
+
+    Example:
+
+    .. code-block:: none
+
+      &target=fallbackSeries(server*.requests_per_second, constantLine(0))
+
+    Draws a 0 line when server metric does not exist.
+
+    """
+    if len(seriesList) > 0:
+        return seriesList
+    else:
+        return fallback
+
 def mostDeviant(requestContext, seriesList, n):
   """
   Takes one metric or a wildcard seriesList followed by an integer N.
@@ -1801,7 +2040,7 @@ def mostDeviant(requestContext, seriesList, n):
 
   .. code-block:: none
 
-    &target=mostDeviant(5, server*.instance*.memory.free)
+    &target=mostDeviant(server*.instance*.memory.free, 5)
 
   Draws the 5 instances furthest from the average memory free.
 
@@ -1816,7 +2055,7 @@ def mostDeviant(requestContext, seriesList, n):
     if sigma is None: continue
     deviants.append( (sigma, series) )
   deviants.sort(key=lambda i: i[0], reverse=True) #sort by sigma
-  return [ series for (sigma,series) in deviants ][:n] #return the n most deviant series
+  return [ series for (_, series) in deviants ][:n] #return the n most deviant series
 
 def stdev(requestContext, seriesList, points, windowTolerance=0.1):
   """
@@ -2206,10 +2445,10 @@ def timeStack(requestContext, seriesList, timeShiftUnit, timeShiftStart, timeShi
   length of time (See ``from / until`` in the render\_api_ for examples of time formats).
   Also takes a start multiplier and end multiplier for the length of time
 
-  create a seriesList which is composed the orginal metric series stacked with time shifts
+  create a seriesList which is composed the original metric series stacked with time shifts
   starting time shifts from the start multiplier through the end multiplier
 
-  Useful for looking at history, or feeding into seriesAverage or seriesStdDev
+  Useful for looking at history, or feeding into averageSeries or stddevSeries.
 
   Example:
 
@@ -2222,7 +2461,10 @@ def timeStack(requestContext, seriesList, timeShiftUnit, timeShiftStart, timeShi
   if timeShiftUnit[0].isdigit():
     timeShiftUnit = '-' + timeShiftUnit
   delta = parseTimeOffset(timeShiftUnit)
-  series = seriesList[0] # if len(seriesList) > 1, they will all have the same pathExpression, which is all we care about.
+
+  # if len(seriesList) > 1, they will all have the same pathExpression, which is all we care about.
+  series = seriesList[0]
+
   results = []
   timeShiftStartint = int(timeShiftStart)
   timeShiftEndint = int(timeShiftEnd)
@@ -2241,7 +2483,7 @@ def timeStack(requestContext, seriesList, timeShiftUnit, timeShiftStart, timeShi
 
   return results
 
-def timeShift(requestContext, seriesList, timeShift, resetEnd=True):
+def timeShift(requestContext, seriesList, timeShift, resetEnd=True, alignDST=False):
   """
   Takes one metric or a wildcard seriesList, followed by a quoted string with the
   length of time (See ``from / until`` in the render\_api_ for examples of time formats).
@@ -2255,6 +2497,10 @@ def timeShift(requestContext, seriesList, timeShift, resetEnd=True):
   date range set to include a time in the future, will limit this timeshift to pretend
   ending at the current time. If resetEnd is False, will instead draw full range including
   future time.
+
+  Because time is shifted by a fixed number of seconds, comparing a time period with DST to
+  a time period without DST, and vice-versa, will result in an apparent misalignment. For
+  example, 8am might be overlaid with 7am. To compensate for this, use the alignDST option.
 
   Useful for comparing a metric against itself at a past periods or correcting data
   stored at an offset.
@@ -2275,12 +2521,34 @@ def timeShift(requestContext, seriesList, timeShift, resetEnd=True):
   myContext = requestContext.copy()
   myContext['startTime'] = requestContext['startTime'] + delta
   myContext['endTime'] = requestContext['endTime'] + delta
+
+  if alignDST:
+    def localDST(dt):
+      return time.localtime(time.mktime(dt.timetuple())).tm_isdst
+
+    reqStartDST = localDST(requestContext['startTime'])
+    reqEndDST   = localDST(requestContext['endTime'])
+    myStartDST  = localDST(myContext['startTime'])
+    myEndDST    = localDST(myContext['endTime'])
+
+    dstOffset = timedelta(hours=0)
+    # If the requestContext is entirely in DST, and we are entirely NOT in DST
+    if ((reqStartDST and reqEndDST) and (not myStartDST and not myEndDST)):
+        dstOffset = timedelta(hours=1)
+    # Or if the requestContext is entirely NOT in DST, and we are entirely in DST
+    elif ((not reqStartDST and not reqEndDST) and (myStartDST and myEndDST)):
+        dstOffset = timedelta(hours=-1)
+    # Otherwise, we don't do anything, because it would be visually confusing
+    myContext['startTime'] += dstOffset
+    myContext['endTime'] += dstOffset
+
   results = []
   if len(seriesList) > 0:
-    series = seriesList[0] # if len(seriesList) > 1, they will all have the same pathExpression, which is all we care about.
+    # if len(seriesList) > 1, they will all have the same pathExpression, which is all we care about.
+    series = seriesList[0]
 
     for shiftedSeries in evaluateTarget(myContext, series.pathExpression):
-      shiftedSeries.name = 'timeShift(%s, %s)' % (shiftedSeries.name, timeShift)
+      shiftedSeries.name = 'timeShift(%s, "%s")' % (shiftedSeries.name, timeShift)
       if resetEnd:
         shiftedSeries.end = series.end
       else:
@@ -2289,6 +2557,44 @@ def timeShift(requestContext, seriesList, timeShift, resetEnd=True):
       results.append(shiftedSeries)
 
   return results
+
+
+def timeSlice(requestContext, seriesList, startSliceAt, endSliceAt="now"):
+  """
+  Takes one metric or a wildcard metric, followed by a quoted string with the
+  time to start the line and another quoted string with the time to end the line.
+  The start and end times are inclusive. See ``from / until`` in the render\_api_
+  for examples of time formats.
+
+  Useful for filtering out a part of a series of data from a wider range of
+  data.
+
+  Example:
+
+  .. code-block:: none
+
+    &target=timeSlice(network.core.port1,"00:00 20140101","11:59 20140630")
+    &target=timeSlice(network.core.port1,"12:00 20140630","now")
+
+  """
+
+  results = []
+  start = time.mktime(parseATTime(startSliceAt).timetuple())
+  end = time.mktime(parseATTime(endSliceAt).timetuple())
+
+  for slicedSeries in seriesList:
+    slicedSeries.name = 'timeSlice(%s, %s, %s)' % (slicedSeries.name, int(start), int(end))
+
+    curr = time.mktime(requestContext["startTime"].timetuple())
+    for i, v in enumerate(slicedSeries):
+      if v is None or curr < start or curr > end:
+        slicedSeries[i] = None
+      curr += slicedSeries.step
+
+    results.append(slicedSeries)
+
+  return results
+
 
 def constantLine(requestContext, value):
   """
@@ -2303,10 +2609,12 @@ def constantLine(requestContext, value):
     &target=constantLine(123.456)
 
   """
-  start = timestamp( requestContext['startTime'] )
-  end = timestamp( requestContext['endTime'] )
+  name = "constantLine(%s)" % str(value)
+  start = int(epoch( requestContext['startTime'] ) )
+  end = int(epoch( requestContext['endTime'] ) )
   step = (end - start) / 1.0
   series = TimeSeries(str(value), start, end, step, [value, value])
+  series.pathExpression = name
   return [series]
 
 def aggregateLine(requestContext, seriesList, func='avg'):
@@ -2327,7 +2635,7 @@ def aggregateLine(requestContext, seriesList, func='avg'):
 
   .. code-block:: none
 
-    &target=aggregateLineSeries(server.connections.total, 'avg')
+    &target=aggregateLine(server.connections.total, 'avg')
 
   """
   t_funcs = { 'avg': safeAvg, 'min': safeMin, 'max': safeMax }
@@ -2366,12 +2674,16 @@ def threshold(requestContext, value, label=None, color=None):
 
   return [series]
 
-def transformNull(requestContext, seriesList, default=0):
+def transformNull(requestContext, seriesList, default=0, referenceSeries=None):
   """
-  Takes a metric or wild card seriesList and an optional value
-  to transform Nulls to. Default is 0. This method compliments
-  drawNullAsZero flag in graphical mode but also works in text only
-  mode.
+  Takes a metric or wildcard seriesList and replaces null values with the value
+  specified by `default`.  The value 0 used if not specified.  The optional
+  referenceSeries, if specified, is a metric or wildcard series list that governs
+  which time intervals nulls should be replaced.  If specified, nulls are replaced
+  only in intervals where a non-null is found for the same interval in any of
+  referenceSeries.  This method compliments the drawNullAsZero function in
+  graphical mode, but also works in text-only mode.
+
   Example:
 
   .. code-block:: none
@@ -2381,24 +2693,34 @@ def transformNull(requestContext, seriesList, default=0):
   This would take any page that didn't have values and supply negative 1 as a default.
   Any other numeric value may be used as well.
   """
-  def transform(v):
-    if v is None: return default
+  def transform(v, d):
+    if v is None: return d
     else: return v
 
+  if referenceSeries:
+    defaults = [default if any(v is not None for v in x) else None for x in izip(*referenceSeries)]
+  else:
+    defaults = None
+
   for series in seriesList:
-    series.name = "transformNull(%s,%g)" % (series.name, default)
+    if referenceSeries:
+      series.name = "transformNull(%s,%g,referenceSeries)" % (series.name, default)
+    else:
+      series.name = "transformNull(%s,%g)" % (series.name, default)
     series.pathExpression = series.name
-    values = [transform(v) for v in series]
+    if defaults:
+      values = [transform(v, d) for v, d in izip(series, defaults)]
+    else:
+      values = [transform(v, default) for v in series]
     series.extend(values)
     del series[:len(values)]
   return seriesList
 
 def isNonNull(requestContext, seriesList):
   """
-  Takes a metric or wild card seriesList and counts up how many
-  non-null values are specified. This is useful for understanding
-  which metrics have data at a given point in time (ie, to count
-  which servers are alive).
+  Takes a metric or wildcard seriesList and counts up the number of non-null
+  values.  This is useful for understanding the number of metrics that have data
+  at a given point in time (i.e. to count which servers are alive).
 
   Example:
 
@@ -2440,8 +2762,8 @@ def identity(requestContext, name):
   """
   step = 60
   delta = timedelta(seconds=step)
-  start = time.mktime(requestContext["startTime"].timetuple())
-  end = time.mktime(requestContext["endTime"].timetuple())
+  start = int(epoch(requestContext["startTime"]))
+  end = int(epoch(requestContext["endTime"]))
   values = range(start, end, step)
   series = TimeSeries(name, start, end, step, values)
   series.pathExpression = 'identity("%s")' % name
@@ -2477,12 +2799,17 @@ def group(requestContext, *seriesLists):
 
 def mapSeries(requestContext, seriesList, mapNode):
   """
-  Takes a seriesList and maps it to a list of sub-seriesList. Each sub-seriesList has the
+  Short form: ``map()``
+
+  Takes a seriesList and maps it to a list of seriesList. Each seriesList has the
   given mapNode in common.
 
-  Example::
+  .. note:: This function is not very useful alone. It should be used with :py:func:`reduceSeries`
 
-    map(servers.*.cpu.*,1) =>
+  .. code-block:: none
+
+    mapSeries(servers.*.cpu.*,1) =>
+
       [
         servers.server1.cpu.*,
         servers.server2.cpu.*,
@@ -2499,32 +2826,58 @@ def mapSeries(requestContext, seriesList, mapNode):
       keys.append(key)
     else:
       metaSeries[key].append(series)
-  return [ metaSeries[key] for key in keys ]
+  return [ metaSeries[k] for k in keys ]
 
 def reduceSeries(requestContext, seriesLists, reduceFunction, reduceNode, *reduceMatchers):
   """
+  Short form: ``reduce()``
+
   Takes a list of seriesLists and reduces it to a list of series by means of the reduceFunction.
 
   Reduction is performed by matching the reduceNode in each series against the list of
-  reduceMatchers. The each series is then passed to the reduceFunction as arguments in the order
+  reduceMatchers. Then each series is passed to the reduceFunction as arguments in the order
   given by reduceMatchers. The reduceFunction should yield a single series.
 
-  Example::
-
-    reduce(map(servers.*.disk.*,1),3,"asPercent","bytes_used","total_bytes") =>
-
-        asPercent(servers.server1.disk.bytes_used,servers.server1.disk.total_bytes),
-        asPercent(servers.server2.disk.bytes_used,servers.server2.disk.total_bytes),
-        ...
-        asPercent(servers.serverN.disk.bytes_used,servers.serverN.disk.total_bytes)
-
   The resulting list of series are aliased so that they can easily be nested in other functions.
-  In the above example, the resulting series names would become::
 
-    servers.server1.disk.reduce.asPercent,
-    servers.server2.disk.reduce.asPercent,
-    ...
-    servers.serverN.disk.reduce.asPercent
+  **Example**: Map/Reduce asPercent(bytes_used,total_bytes) for each server
+
+  Assume that metrics in the form below exist:
+
+  .. code-block:: none
+
+       servers.server1.disk.bytes_used
+       servers.server1.disk.total_bytes
+       servers.server2.disk.bytes_used
+       servers.server2.disk.total_bytes
+       servers.server3.disk.bytes_used
+       servers.server3.disk.total_bytes
+       ...
+       servers.serverN.disk.bytes_used
+       servers.serverN.disk.total_bytes
+
+  To get the percentage of disk used for each server:
+
+  .. code-block:: none
+
+      reduceSeries(mapSeries(servers.*.disk.*,1),"asPercent",3,"bytes_used","total_bytes") =>
+
+        alias(asPercent(servers.server1.disk.bytes_used,servers.server1.disk.total_bytes),"servers.server1.disk.reduce.asPercent"),
+        alias(asPercent(servers.server2.disk.bytes_used,servers.server2.disk.total_bytes),"servers.server2.disk.reduce.asPercent"),
+        alias(asPercent(servers.server3.disk.bytes_used,servers.server3.disk.total_bytes),"servers.server3.disk.reduce.asPercent"),
+        ...
+        alias(asPercent(servers.serverN.disk.bytes_used,servers.serverN.disk.total_bytes),"servers.serverN.disk.reduce.asPercent")
+
+  In other words, we will get back the following metrics::
+
+      servers.server1.disk.reduce.asPercent
+      servers.server2.disk.reduce.asPercent
+      servers.server3.disk.reduce.asPercent
+      ...
+      servers.serverN.disk.reduce.asPercent
+
+  .. seealso:: :py:func:`mapSeries`
+
   """
   metaSeries = {}
   keys = []
@@ -2540,7 +2893,7 @@ def reduceSeries(requestContext, seriesLists, reduceFunction, reduceNode, *reduc
         i = reduceMatchers.index(node)
         metaSeries[reduceSeriesName][i] = series
   for key in keys:
-    metaSeries[key] = SeriesFunctions[reduceFunction](requestContext,metaSeries[key])[0]
+    metaSeries[key] = SeriesFunctions[reduceFunction](requestContext,*[[l] for l in metaSeries[key]])[0]
     metaSeries[key].name = key
   return [ metaSeries[key] for key in keys ]
 
@@ -2552,8 +2905,11 @@ def groupByNode(requestContext, seriesList, nodeNum, callback):
 
     &target=groupByNode(ganglia.by-function.*.*.cpu.load5,2,"sumSeries")
 
-    Would return multiple series which are each the result of applying the "sumSeries" function
-    to groups joined on the second node (0 indexed) resulting in a list of targets like
+  Would return multiple series which are each the result of applying the "sumSeries" function
+  to groups joined on the second node (0 indexed) resulting in a list of targets like
+
+  .. code-block :: none
+
     sumSeries(ganglia.by-function.server1.*.cpu.load5),sumSeries(ganglia.by-function.server2.*.cpu.load5),...
 
   """
@@ -2561,7 +2917,7 @@ def groupByNode(requestContext, seriesList, nodeNum, callback):
   keys = []
   for series in seriesList:
     key = series.name.split(".")[nodeNum]
-    if key not in metaSeries.keys():
+    if key not in metaSeries:
       metaSeries[key] = [series]
       keys.append(key)
     else:
@@ -2640,8 +2996,8 @@ def smartSummarize(requestContext, seriesList, intervalString, func='sum', align
     datapoints = zip(timestamps, series)
 
     # Populate buckets
-    for (timestamp, value) in datapoints:
-      bucketInterval = int((timestamp - series.start) / interval)
+    for timestamp_, value in datapoints:
+      bucketInterval = int((timestamp_ - series.start) / interval)
 
       if bucketInterval not in buckets:
         buckets[bucketInterval] = []
@@ -2651,8 +3007,8 @@ def smartSummarize(requestContext, seriesList, intervalString, func='sum', align
 
 
     newValues = []
-    for timestamp in range(series.start, series.end, interval):
-      bucketInterval = int((timestamp - series.start) / interval)
+    for timestamp_ in range(series.start, series.end, interval):
+      bucketInterval = int((timestamp_ - series.start) / interval)
       bucket = buckets.get(bucketInterval, [])
 
       if bucket:
@@ -2690,7 +3046,7 @@ def summarize(requestContext, seriesList, intervalString, func='sum', alignToFro
 
   'max', 'min' or 'last' can also be specified.
 
-  By default, buckets are caculated by rounding to the nearest interval. This
+  By default, buckets are calculated by rounding to the nearest interval. This
   works well for intervals smaller than a day. For example, 22:32 will end up
   in the bucket 22:00-23:00 when the interval=1hour.
 
@@ -2718,11 +3074,11 @@ def summarize(requestContext, seriesList, intervalString, func='sum', alignToFro
     timestamps = range( int(series.start), int(series.end), int(series.step) )
     datapoints = zip(timestamps, series)
 
-    for (timestamp, value) in datapoints:
+    for timestamp_, value in datapoints:
       if alignToFrom:
-        bucketInterval = int((timestamp - series.start) / interval)
+        bucketInterval = int((timestamp_ - series.start) / interval)
       else:
-        bucketInterval = timestamp - (timestamp % interval)
+        bucketInterval = timestamp_ - (timestamp_ % interval)
 
       if bucketInterval not in buckets:
         buckets[bucketInterval] = []
@@ -2738,12 +3094,12 @@ def summarize(requestContext, seriesList, intervalString, func='sum', alignToFro
       newEnd = series.end - (series.end % interval) + interval
 
     newValues = []
-    for timestamp in range(newStart, newEnd, interval):
+    for timestamp_ in range(newStart, newEnd, interval):
       if alignToFrom:
-        newEnd = timestamp
-        bucketInterval = int((timestamp - series.start) / interval)
+        newEnd = timestamp_
+        bucketInterval = int((timestamp_ - series.start) / interval)
       else:
-        bucketInterval = timestamp - (timestamp % interval)
+        bucketInterval = timestamp_ - (timestamp_ % interval)
 
       bucket = buckets.get(bucketInterval, [])
 
@@ -2855,7 +3211,7 @@ def hitcount(requestContext, seriesList, intervalString, alignToInterval = False
   return results
 
 
-def timeFunction(requestContext, name):
+def timeFunction(requestContext, name, step=60):
   """
   Short Alias: time()
 
@@ -2869,10 +3225,9 @@ def timeFunction(requestContext, name):
 
   This would create a series named "The.time.series" that contains in Y the same
   value (in seconds) as X.
+  Accepts optional second argument as 'step' parameter (default step is 60 sec)
 
   """
-
-  step = 60
   delta = timedelta(seconds=step)
   when = requestContext["startTime"]
   values = []
@@ -2889,7 +3244,7 @@ def timeFunction(requestContext, name):
 
   return [series]
 
-def sinFunction(requestContext, name, amplitude=1):
+def sinFunction(requestContext, name, amplitude=1, step=60):
   """
   Short Alias: sin()
 
@@ -2903,8 +3258,9 @@ def sinFunction(requestContext, name, amplitude=1):
     &target=sin("The.time.series", 2)
 
   This would create a series named "The.time.series" that contains sin(x)*2.
+  Accepts optional second argument as 'amplitude' parameter (default amplitude is 1)
+  Accepts optional third argument as 'step' parameter (default step is 60 sec)
   """
-  step = 60
   delta = timedelta(seconds=step)
   when = requestContext["startTime"]
   values = []
@@ -2914,11 +3270,27 @@ def sinFunction(requestContext, name, amplitude=1):
     when += delta
 
   return [TimeSeries(name,
-            int(time.mktime(requestContext["startTime"].timetuple())),
-            int(time.mktime(requestContext["endTime"].timetuple())),
+            int(epoch(requestContext["startTime"])),
+            int(epoch(requestContext["endTime"])),
             step, values)]
 
-def randomWalkFunction(requestContext, name):
+def removeEmptySeries(requestContext, seriesList):
+    """
+    Takes one metric or a wildcard seriesList.
+    Out of all metrics passed, draws only the metrics with not empty data
+
+    Example:
+
+    .. code-block:: none
+
+      &target=removeEmptySeries(server*.instance*.threads.busy)
+
+    Draws only live servers with not empty data.
+
+    """
+    return [ series for series in seriesList if safeIsNotEmpty(series) ]
+
+def randomWalkFunction(requestContext, name, step=60):
   """
   Short Alias: randomWalk()
 
@@ -2933,8 +3305,8 @@ def randomWalkFunction(requestContext, name):
 
   This would create a series named "The.time.series" that contains points where
   x(t) == x(t-1)+random()-0.5, and x(0) == 0.
+  Accepts optional second argument as 'step' parameter (default step is 60 sec)
   """
-  step = 60
   delta = timedelta(seconds=step)
   when = requestContext["startTime"]
   values = []
@@ -2945,8 +3317,8 @@ def randomWalkFunction(requestContext, name):
     when += delta
 
   return [TimeSeries(name,
-            int(time.mktime(requestContext["startTime"].timetuple())),
-            int(time.mktime(requestContext["endTime"].timetuple())),
+            int(epoch(requestContext["startTime"])),
+            int(epoch(requestContext["endTime"])),
             step, values)]
 
 def events(requestContext, *tags):
@@ -3007,120 +3379,130 @@ def pieMinimum(requestContext, series):
   return min(series)
 
 PieFunctions = {
-  'average' : pieAverage,
-  'maximum' : pieMaximum,
-  'minimum' : pieMinimum,
+  'average': pieAverage,
+  'maximum': pieMaximum,
+  'minimum': pieMinimum,
 }
 
 SeriesFunctions = {
   # Combine functions
-  'sumSeries' : sumSeries,
-  'sum' : sumSeries,
-  'multiplySeries' : multiplySeries,
-  'averageSeries' : averageSeries,
-  'stddevSeries' : stddevSeries,
-  'avg' : averageSeries,
+  'sumSeries': sumSeries,
+  'sum': sumSeries,
+  'multiplySeries': multiplySeries,
+  'averageSeries': averageSeries,
+  'stddevSeries': stddevSeries,
+  'avg': averageSeries,
   'sumSeriesWithWildcards': sumSeriesWithWildcards,
   'averageSeriesWithWildcards': averageSeriesWithWildcards,
-  'minSeries' : minSeries,
-  'maxSeries' : maxSeries,
+  'multiplySeriesWithWildcards': multiplySeriesWithWildcards,
+  'minSeries': minSeries,
+  'maxSeries': maxSeries,
   'rangeOfSeries': rangeOfSeries,
   'percentileOfSeries': percentileOfSeries,
   'countSeries': countSeries,
   'weightedAverage': weightedAverage,
 
   # Transform functions
-  'scale' : scale,
-  'invert' : invert,
-  'scaleToSeconds' : scaleToSeconds,
-  'offset' : offset,
-  'offsetToZero' : offsetToZero,
-  'derivative' : derivative,
-  'perSecond' : perSecond,
-  'integral' : integral,
-  'percentileOfSeries': percentileOfSeries,
-  'nonNegativeDerivative' : nonNegativeDerivative,
-  'log' : logarithm,
+  'scale': scale,
+  'scaleToSeconds': scaleToSeconds,
+  'offset': offset,
+  'offsetToZero': offsetToZero,
+  'derivative': derivative,
+  'squareRoot': squareRoot,
+  'pow': pow,
+  'perSecond': perSecond,
+  'integral': integral,
+  'nonNegativeDerivative': nonNegativeDerivative,
+  'log': logarithm,
+  'invert': invert,
   'timeStack': timeStack,
   'timeShift': timeShift,
-  'summarize' : summarize,
-  'smartSummarize' : smartSummarize,
-  'hitcount'  : hitcount,
-  'absolute' : absolute,
+  'timeSlice': timeSlice,
+  'summarize': summarize,
+  'smartSummarize': smartSummarize,
+  'hitcount': hitcount,
+  'absolute': absolute,
 
   # Calculate functions
-  'movingAverage' : movingAverage,
-  'movingMedian' : movingMedian,
-  'stdev' : stdev,
+  'movingAverage': movingAverage,
+  'movingMedian': movingMedian,
+  'stdev': stdev,
   'holtWintersForecast': holtWintersForecast,
   'holtWintersConfidenceBands': holtWintersConfidenceBands,
   'holtWintersConfidenceArea': holtWintersConfidenceArea,
   'holtWintersAberration': holtWintersAberration,
-  'asPercent' : asPercent,
-  'pct' : asPercent,
-  'diffSeries' : diffSeries,
-  'divideSeries' : divideSeries,
+  'asPercent': asPercent,
+  'pct': asPercent,
+  'diffSeries': diffSeries,
+  'divideSeries': divideSeries,
 
   # Series Filter functions
-  'mostDeviant' : mostDeviant,
-  'highestCurrent' : highestCurrent,
-  'lowestCurrent' : lowestCurrent,
-  'highestMax' : highestMax,
-  'currentAbove' : currentAbove,
-  'currentBelow' : currentBelow,
-  'highestAverage' : highestAverage,
-  'lowestAverage' : lowestAverage,
-  'averageAbove' : averageAbove,
-  'averageBelow' : averageBelow,
-  'maximumAbove' : maximumAbove,
-  'minimumAbove' : minimumAbove,
-  'maximumBelow' : maximumBelow,
-  'nPercentile' : nPercentile,
-  'limit' : limit,
-  'sortByTotal'  : sortByTotal,
-  'sortByName' : sortByName,
-  'averageOutsidePercentile' : averageOutsidePercentile,
-  'removeBetweenPercentile' : removeBetweenPercentile,
-  'sortByMaxima' : sortByMaxima,
-  'sortByMinima' : sortByMinima,
+  'fallbackSeries': fallbackSeries,
+  'mostDeviant': mostDeviant,
+  'highestCurrent': highestCurrent,
+  'lowestCurrent': lowestCurrent,
+  'highestMax': highestMax,
+  'currentAbove': currentAbove,
+  'currentBelow': currentBelow,
+  'highestAverage': highestAverage,
+  'lowestAverage': lowestAverage,
+  'averageAbove': averageAbove,
+  'averageBelow': averageBelow,
+  'maximumAbove': maximumAbove,
+  'minimumAbove': minimumAbove,
+  'maximumBelow': maximumBelow,
+  'minimumBelow': minimumBelow,
+  'nPercentile': nPercentile,
+  'limit': limit,
+  'sortByTotal': sortByTotal,
+  'sortByName': sortByName,
+  'averageOutsidePercentile': averageOutsidePercentile,
+  'removeBetweenPercentile': removeBetweenPercentile,
+  'sortByMaxima': sortByMaxima,
+  'sortByMinima': sortByMinima,
   'useSeriesAbove': useSeriesAbove,
-  'exclude' : exclude,
+  'exclude': exclude,
+  'grep': grep,
+  'removeEmptySeries': removeEmptySeries,
 
   # Data Filter functions
-  'removeAbovePercentile' : removeAbovePercentile,
-  'removeAboveValue' : removeAboveValue,
-  'removeBelowPercentile' : removeBelowPercentile,
-  'removeBelowValue' : removeBelowValue,
+  'removeAbovePercentile': removeAbovePercentile,
+  'removeAboveValue': removeAboveValue,
+  'removeBelowPercentile': removeBelowPercentile,
+  'removeBelowValue': removeBelowValue,
 
   # Special functions
-  'legendValue' : legendValue,
-  'alias' : alias,
-  'aliasSub' : aliasSub,
-  'aliasByNode' : aliasByNode,
-  'aliasByMetric' : aliasByMetric,
-  'cactiStyle' : cactiStyle,
-  'color' : color,
-  'alpha' : alpha,
-  'cumulative' : cumulative,
-  'consolidateBy' : consolidateBy,
-  'keepLastValue' : keepLastValue,
-  'drawAsInfinite' : drawAsInfinite,
+  'legendValue': legendValue,
+  'alias': alias,
+  'aliasSub': aliasSub,
+  'aliasByNode': aliasByNode,
+  'aliasByMetric': aliasByMetric,
+  'cactiStyle': cactiStyle,
+  'color': color,
+  'alpha': alpha,
+  'cumulative': cumulative,
+  'consolidateBy': consolidateBy,
+  'keepLastValue': keepLastValue,
+  'changed': changed,
+  'drawAsInfinite': drawAsInfinite,
   'secondYAxis': secondYAxis,
-  'lineWidth' : lineWidth,
-  'dashed' : dashed,
-  'substr' : substr,
-  'group' : group,
+  'lineWidth': lineWidth,
+  'dashed': dashed,
+  'substr': substr,
+  'group': group,
   'map': mapSeries,
+  'mapSeries': mapSeries,
   'reduce': reduceSeries,
-  'groupByNode' : groupByNode,
-  'constantLine' : constantLine,
-  'stacked' : stacked,
-  'areaBetween' : areaBetween,
-  'threshold' : threshold,
-  'transformNull' : transformNull,
-  'isNonNull' : isNonNull,
+  'reduceSeries': reduceSeries,
+  'groupByNode': groupByNode,
+  'constantLine': constantLine,
+  'stacked': stacked,
+  'areaBetween': areaBetween,
+  'threshold': threshold,
+  'transformNull': transformNull,
+  'isNonNull': isNonNull,
   'identity': identity,
-  'aggregateLine' : aggregateLine,
+  'aggregateLine': aggregateLine,
 
   # test functions
   'time': timeFunction,
@@ -3130,11 +3512,11 @@ SeriesFunctions = {
   "sinFunction": sinFunction,
   "randomWalkFunction": randomWalkFunction,
 
-  #events
+  # events
   'events': events,
 }
 
 
-#Avoid import circularity
+# Avoid import circularity
 if not environ.get('READTHEDOCS'):
   from graphite.render.evaluator import evaluateTarget
